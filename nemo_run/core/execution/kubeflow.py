@@ -25,7 +25,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterable, Optional
+from typing import Any, ClassVar, Iterable, Optional
 
 from jinja2 import Environment, PackageLoader, select_autoescape
 
@@ -76,6 +76,16 @@ class KubeflowExecutor(Executor):
     Args:
         runtime_ref: ``ClusterTrainingRuntime`` name used by TrainJob (e.g. ``"torch-distributed"``).
     """
+
+    # CRD coordinates for the Training-Operator custom resource. Defaults target
+    # the v2 TrainJob (``trainer.kubeflow.org``). Subclasses can point these at a
+    # different API — e.g. ``PyTorchJobExecutor`` retargets them to the v1
+    # ``kubeflow.org`` PyTorchJob — so launch/status/cancel work unchanged across
+    # operator versions. ClassVars, so they are not dataclass fields.
+    crd_group: ClassVar[str] = _TRAINJOB_GROUP
+    crd_version: ClassVar[str] = _TRAINJOB_VERSION
+    crd_plural: ClassVar[str] = _TRAINJOB_PLURAL
+    crd_kind: ClassVar[str] = _TRAINJOB_KIND
 
     runtime_ref: str = "torch-distributed"
     namespace: str = "default"
@@ -293,8 +303,8 @@ class KubeflowExecutor(Executor):
             metadata["annotations"] = self.annotations
 
         return {
-            "apiVersion": f"{_TRAINJOB_GROUP}/{_TRAINJOB_VERSION}",
-            "kind": _TRAINJOB_KIND,
+            "apiVersion": f"{self.crd_group}/{self.crd_version}",
+            "kind": self.crd_kind,
             "metadata": metadata,
             "spec": spec,
         }
@@ -341,10 +351,10 @@ class KubeflowExecutor(Executor):
         job_body = self.get_job_body(name, cmd)
         try:
             self._custom_objects_api.create_namespaced_custom_object(
-                group=_TRAINJOB_GROUP,
-                version=_TRAINJOB_VERSION,
+                group=self.crd_group,
+                version=self.crd_version,
                 namespace=self.namespace,
-                plural=_TRAINJOB_PLURAL,
+                plural=self.crd_plural,
                 body=job_body,
             )
         except ApiException as e:
@@ -357,18 +367,18 @@ class KubeflowExecutor(Executor):
             # setup_experiment's "attempt N of M") makes progress instead of
             # re-colliding on the same name.
             logger.warning(
-                "%s %s already exists; deleting stale job and recreating", _TRAINJOB_KIND, name
+                "%s %s already exists; deleting stale job and recreating", self.crd_kind, name
             )
             self.cancel(name, wait=True)
             self._custom_objects_api.create_namespaced_custom_object(
-                group=_TRAINJOB_GROUP,
-                version=_TRAINJOB_VERSION,
+                group=self.crd_group,
+                version=self.crd_version,
                 namespace=self.namespace,
-                plural=_TRAINJOB_PLURAL,
+                plural=self.crd_plural,
                 body=job_body,
             )
 
-        logger.info("Submitted %s %s to namespace %s", _TRAINJOB_KIND, name, self.namespace)
+        logger.info("Submitted %s %s to namespace %s", self.crd_kind, name, self.namespace)
 
         if not wait:
             return name, KubeflowJobState.CREATED
@@ -379,7 +389,7 @@ class KubeflowExecutor(Executor):
         while time.time() < deadline:
             state = self.status(name) or KubeflowJobState.UNKNOWN
             if state != last_logged_state:
-                logger.info("%s %s: %s", _TRAINJOB_KIND, name, state.value)
+                logger.info("%s %s: %s", self.crd_kind, name, state.value)
                 last_logged_state = state
             if state == KubeflowJobState.RUNNING:
                 return name, state
@@ -388,7 +398,7 @@ class KubeflowExecutor(Executor):
             time.sleep(poll_interval)
 
         raise RuntimeError(
-            f"{_TRAINJOB_KIND} {name} did not reach RUNNING within {timeout}s, last state: {state}"
+            f"{self.crd_kind} {name} did not reach RUNNING within {timeout}s, last state: {state}"
         )
 
     def status(self, job_name: str) -> Optional[KubeflowJobState]:
@@ -397,10 +407,10 @@ class KubeflowExecutor(Executor):
         for attempt in range(2):
             try:
                 resp = self._custom_objects_api.get_namespaced_custom_object(
-                    group=_TRAINJOB_GROUP,
-                    version=_TRAINJOB_VERSION,
+                    group=self.crd_group,
+                    version=self.crd_version,
                     namespace=self.namespace,
-                    plural=_TRAINJOB_PLURAL,
+                    plural=self.crd_plural,
                     name=job_name,
                 )
                 break
@@ -427,9 +437,15 @@ class KubeflowExecutor(Executor):
         if resp is None:
             return None
 
-        job_status = resp.get("status", {})
+        return self._parse_status(resp.get("status", {}))
 
-        # TrainJob (v2) uses status.jobsStatus[].{active,ready,succeeded,failed}
+    def _parse_status(self, job_status: dict) -> KubeflowJobState:
+        """Map a custom-resource ``.status`` dict to a ``KubeflowJobState``.
+
+        Overridable seam: the v2 TrainJob exposes ``status.jobsStatus[]`` with
+        ``{active,ready,succeeded,failed}`` counts. Other Training-Operator APIs
+        (e.g. the v1 PyTorchJob's ``status.conditions[]``) override this.
+        """
         jobs_status = job_status.get("jobsStatus", [])
         if any(js.get("failed", 0) > 0 for js in jobs_status):
             return KubeflowJobState.FAILED
@@ -440,6 +456,22 @@ class KubeflowExecutor(Executor):
         if any(js.get("active", 0) > 0 or js.get("ready", 0) > 0 for js in jobs_status):
             return KubeflowJobState.RUNNING
         return KubeflowJobState.UNKNOWN
+
+    def _pod_label_selector(self, job_name: str) -> str:
+        """Label selector matching all pods of *job_name*.
+
+        Overridable seam: v2 TrainJob pods carry the JobSet name label; the v1
+        PyTorchJob executor overrides this with the operator's job-name label.
+        """
+        return f"jobset.sigs.k8s.io/jobset-name={job_name}"
+
+    def _completion_index_label(self) -> str:
+        """Pod label whose value is the torchrun node rank (0..num_nodes-1).
+
+        Overridable seam: v2 uses the batch/JobSet completion-index label; the v1
+        PyTorchJob executor overrides it with the operator's replica-index label.
+        """
+        return "batch.kubernetes.io/job-completion-index"
 
     def fetch_logs(
         self,
@@ -476,7 +508,7 @@ class KubeflowExecutor(Executor):
         # To avoid re-emitting the full history on every re-attach, reconnects
         # resume via `--since-time` (with `--timestamps`); only the first attach
         # uses `--tail=-1` to capture pre-existing history.
-        label_selector = f"jobset.sigs.k8s.io/jobset-name={job_name}"
+        label_selector = self._pod_label_selector(job_name)
         max_log_requests = max(self.num_nodes * 2, 8)
         base_cmd = [
             "kubectl",
@@ -543,7 +575,7 @@ class KubeflowExecutor(Executor):
             for item in items:
                 meta = item.get("metadata", {})
                 name = meta.get("name")
-                idx = (meta.get("labels", {}) or {}).get("batch.kubernetes.io/job-completion-index")
+                idx = (meta.get("labels", {}) or {}).get(self._completion_index_label())
                 if name is not None and idx is not None:
                     mapping[name] = int(idx)
             return mapping
@@ -750,22 +782,22 @@ class KubeflowExecutor(Executor):
         """
         try:
             self._custom_objects_api.delete_namespaced_custom_object(
-                group=_TRAINJOB_GROUP,
-                version=_TRAINJOB_VERSION,
+                group=self.crd_group,
+                version=self.crd_version,
                 namespace=self.namespace,
-                plural=_TRAINJOB_PLURAL,
+                plural=self.crd_plural,
                 name=job_name,
             )
         except ApiException as e:
             if e.status == 404:
-                logger.info("%s %s already deleted", _TRAINJOB_KIND, job_name)
+                logger.info("%s %s already deleted", self.crd_kind, job_name)
                 return None
             raise
 
         if not wait:
             return None
 
-        label_selector = f"jobset.sigs.k8s.io/jobset-name={job_name}"
+        label_selector = self._pod_label_selector(job_name)
         deadline = time.time() + timeout
 
         while time.time() < deadline:
@@ -774,10 +806,10 @@ class KubeflowExecutor(Executor):
             # Check if CR is gone
             try:
                 self._custom_objects_api.get_namespaced_custom_object(
-                    group=_TRAINJOB_GROUP,
-                    version=_TRAINJOB_VERSION,
+                    group=self.crd_group,
+                    version=self.crd_version,
                     namespace=self.namespace,
-                    plural=_TRAINJOB_PLURAL,
+                    plural=self.crd_plural,
                     name=job_name,
                 )
                 continue  # CR still present
