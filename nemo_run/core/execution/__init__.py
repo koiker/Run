@@ -17,6 +17,7 @@ from nemo_run.core.execution.dgxcloud import DGXCloudExecutor
 from nemo_run.core.execution.lepton import LeptonExecutor
 from nemo_run.core.execution.local import LocalExecutor
 from nemo_run.core.execution.kubeflow import KubeflowExecutor
+from nemo_run.core.execution.pytorchjob import PyTorchJobExecutor
 from nemo_run.core.execution.skypilot import SkypilotExecutor
 from nemo_run.core.execution.slurm import SlurmExecutor
 
@@ -27,4 +28,5 @@ __all__ = [
     "DGXCloudExecutor",
     "LeptonExecutor",
     "KubeflowExecutor",
+    "PyTorchJobExecutor",
 ]
