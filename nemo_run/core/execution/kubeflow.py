@@ -33,6 +33,7 @@ except ImportError:
     _KUBERNETES_AVAILABLE = False
 
 from nemo_run.core.execution.base import Executor, ExecutorMacros
+from nemo_run.core.execution.utils import sanitize_k8s_name
 from nemo_run.core.packaging.base import Packager
 
 logger = logging.getLogger(__name__)
@@ -255,7 +256,10 @@ class KubeflowExecutor(Executor):
         observed ``RUNNING``, ``SUCCEEDED``, or ``FAILED`` state when *wait* is ``True``.
         Raises ``RuntimeError`` if the job already exists or *timeout* expires.
         """
-        name = name.replace("_", "-").replace(".", "-").lower()
+        # Coerce to a valid RFC 1123 label (lowercase, no leading/trailing '-');
+        # strict admission webhooks (e.g. Run:ai) reject otherwise-valid names
+        # that start or end with a hyphen.
+        name = sanitize_k8s_name(name)
         job_body = self.get_job_body(name, cmd)
         try:
             self._custom_objects_api.create_namespaced_custom_object(

@@ -46,6 +46,7 @@ from leptonai.api.v1.types.replica import Replica
 
 from nemo_run.config import get_nemorun_home
 from nemo_run.core.execution.base import Executor, ExecutorMacros
+from nemo_run.core.execution.utils import sanitize_k8s_name
 from nemo_run.core.packaging.base import Packager
 from nemo_run.core.packaging.git import GitArchivePackager
 
@@ -300,10 +301,10 @@ class LeptonExecutor(Executor):
 
     def launch(self, name: str, cmd: list[str]) -> tuple[str, str]:
         self._validate_mounts()
-        name = name.replace("_", "-").replace(".", "-").lower()  # to meet K8s requirements
         if len(name) > 35:
             logger.warning("length of name exceeds 35 characters. Shortening...")
-            name = name[:34]
+        # RFC 1123 label, capped at Lepton's 34-char limit, with no leading/trailing '-'.
+        name = sanitize_k8s_name(name, max_length=34)
 
         # Build pre-launch commands section
         pre_launch_section = ""

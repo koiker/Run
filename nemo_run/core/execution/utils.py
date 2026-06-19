@@ -14,9 +14,55 @@
 # limitations under the License.
 
 import os
+import re
 from typing import Optional
 
 import jinja2
+
+# RFC 1123 DNS label limit, used for Kubernetes object names (Jobs, PyTorchJobs,
+# TrainJobs) and the pod names schedulers derive from them.
+RFC1123_LABEL_MAX_LENGTH = 63
+
+
+def sanitize_k8s_name(name: str, max_length: int = RFC1123_LABEL_MAX_LENGTH) -> str:
+    """Coerce an arbitrary string into a valid RFC 1123 DNS label.
+
+    Kubernetes object names — and the pod names schedulers derive from them — must
+    be a lowercase RFC 1123 DNS label: ``[a-z0-9]([-a-z0-9]*[a-z0-9])?`` with a
+    maximum length of 63 characters. Several schedulers enforce this strictly and
+    reject names that merely *contain* the right characters but begin or end with
+    a ``-`` — notably **NVIDIA Run:ai**, where a job name derived from an
+    underscore- or timestamp-prefixed experiment id (e.g. ``_exp.1`` ->
+    ``-exp-1``) is refused by the admission webhook.
+
+    The previous ``name.replace("_", "-").replace(".", "-").lower()`` idiom fixed
+    only ``_`` and ``.`` and could still emit leading/trailing hyphens or other
+    invalid characters. This normalizes by lowercasing, collapsing every run of
+    invalid characters into a single ``-``, truncating to ``max_length``, and
+    stripping leading/trailing ``-`` so the result begins and ends with an
+    alphanumeric.
+
+    Args:
+        name: Arbitrary candidate name.
+        max_length: Maximum label length (default 63, the RFC 1123 label limit).
+
+    Returns:
+        A valid RFC 1123 DNS label. Falls back to ``"job"`` if *name* sanitizes to
+        an empty string (e.g. it was entirely punctuation).
+
+    Raises:
+        ValueError: if *name* is empty.
+    """
+    if not name:
+        raise ValueError("name must be a non-empty string")
+
+    # Lowercase, then collapse any run of non-[a-z0-9] characters into a single
+    # hyphen (covers '_', '.', whitespace, and anything else a caller passes in).
+    sanitized = re.sub(r"[^a-z0-9]+", "-", name.lower())
+    # Truncate before the final strip so a hyphen exposed at the cut point is
+    # also removed, guaranteeing the last character is alphanumeric.
+    sanitized = sanitized[:max_length].strip("-")
+    return sanitized or "job"
 
 
 def fill_template(template_name: str, variables: dict, template_dir: Optional[str] = None) -> str:

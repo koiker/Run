@@ -32,7 +32,7 @@ from invoke.context import Context
 from nemo_run.config import RUNDIR_NAME, get_nemorun_home
 from nemo_run.core.execution.base import Executor, ExecutorMacros
 from nemo_run.core.execution.launcher import FaultTolerance, Launcher, Torchrun
-from nemo_run.core.execution.utils import fill_template
+from nemo_run.core.execution.utils import fill_template, sanitize_k8s_name
 from nemo_run.core.frontend.console.api import CONSOLE
 from nemo_run.core.packaging.base import Packager
 from nemo_run.core.packaging.git import GitArchivePackager
@@ -311,7 +311,7 @@ class DGXCloudExecutor(Executor):
         return response
 
     def launch(self, name: str, cmd: list[str]) -> tuple[str, str]:
-        name = name.replace("_", "-").replace(".", "-").lower()  # to meet K8s requirements
+        name = sanitize_k8s_name(name)  # RFC 1123 label: lowercase, no leading/trailing '-'
         logger.info(f"workload name:{name}")
         token = self.get_auth_token()
         if not token:
